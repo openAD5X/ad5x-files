@@ -1,0 +1,160 @@
+#!/bin/sh
+# Copyright (C) 2026  sterling motuz <Sterling@dexabyte.ca>
+# Made for the OpenAD5X project
+# This file may be distributed under the terms of the MIT license.
+#
+# Takes the place of FlashForge's firmwareExe on stock AD5X firmware 3.1.x.
+# It brings up the network from the touchscreen's saved settings
+# (Adventurer5M.json: Wi-Fi, Ethernet, hotspot or a manual address) and then
+# runs /usr/data/openad5x/startup/startup.sh. Because the network comes up
+# here first, Wi-Fi and SSH keep working even if a startup script fails.
+
+msg_file=/tmp/openad5x.log
+ff_json=/usr/prog/config/Adventurer5M.json
+wifi_dir=/usr/prog/wifi
+
+note() {
+    echo "$1" >> "$msg_file"
+}
+
+note "firmwareExe is starting..."
+
+# the stock app_startup.sh preloads tslib for its Qt UI; hard-float
+# programs started from here can't load it
+unset LD_PRELOAD
+
+note "FE: Enabling legacy NaN and mounting Entware..."
+sh /usr/data/openad5x/startup/scripts/01-fixnan.sh
+if [ ! -x /opt/bin/opkg ] && [ -d /usr/data/bin/opt ] && ! grep -q ' /opt ' /proc/mounts; then
+    mount --bind /usr/data/bin/opt /opt
+fi
+
+# value of key $1 from the "network" section of the FlashForge JSON
+netcfg() {
+    sed -n '/"network"/,/}/s/.*"'"$1"'" *: *"\{0,1\}\([^",]*\).*/\1/p' "$ff_json" | head -n 1
+}
+
+# static address when the user set one, otherwise DHCP
+addr_up() {
+    iface=$1
+    if [ "$(netcfg isManual)" != true ]; then
+        udhcpc -b -i "$iface" -p /var/run/udhcpc-$iface.pid
+        return
+    fi
+    ifconfig "$iface" "$(netcfg configIp)" netmask "$(netcfg configNetmask)"
+    gateway=$(netcfg configGateway)
+    if [ -n "$gateway" ]; then
+        route add default gw "$gateway"
+    fi
+    nameserver=$(netcfg configDns)
+    if [ -n "$nameserver" ]; then
+        echo "nameserver $nameserver # $iface" > /etc/resolv.conf
+    fi
+}
+
+hotspot_up() {
+    ifconfig wlan0 down
+    ifconfig wlan0 up
+    sleep 1
+    ifconfig wlan0 192.168.0.240
+    mkdir -p /var/lib/misc/
+    touch /var/lib/misc/udhcpd.leases
+    udhcpd -I 192.168.0.240
+    hostapd -B $wifi_dir/rtl_hostapd_2G.conf
+}
+
+wifi_up() {
+    ip addr flush dev eth0
+    ifconfig wlan0 down
+    killall wpa_supplicant udhcpc 2>/dev/null
+    ifconfig wlan0 up
+    wpa_supplicant -d -Dnl80211 -iwlan0 -c$wifi_dir/wpa_supplicant.conf -B
+    wpa_cli -i wlan0 enable_network all
+    addr_up wlan0
+}
+
+cable_state() {
+    cat /sys/class/net/eth0/carrier 2>/dev/null
+}
+
+# follows the Ethernet cable: new address when plugged, cleared when pulled
+cable_monitor() {
+    before=$(cable_state)
+    while :; do
+        sleep 2
+        after=$(cable_state)
+        if [ "$after" = "$before" ]; then
+            continue
+        fi
+        # stop only the DHCP client on eth0; the Wi-Fi one stays
+        for dhcp_pid in $(pidof udhcpc); do
+            if tr '\0' ' ' < /proc/$dhcp_pid/cmdline | grep -q eth0; then
+                kill $dhcp_pid
+            fi
+        done
+        ip addr flush dev eth0
+        if [ "$after" = 1 ]; then
+            note "eth0: cable plugged in"
+            addr_up eth0
+        else
+            note "eth0: cable pulled"
+        fi
+        before=$after
+    done
+}
+
+ethernet_up() {
+    ifconfig eth0 up
+    sleep 1
+    if [ "$(cable_state)" = 1 ]; then
+        addr_up eth0
+    fi
+    cable_monitor &
+}
+
+bring_up_network() {
+    if [ "$(netcfg wifiHotspotStatus)" = true ]; then
+        note "network: hotspot"
+        hotspot_up
+    elif [ "$(netcfg wifiStationStatus)" = true ]; then
+        note "network: wifi"
+        wifi_up
+    elif [ "$(netcfg ethernetStatus)" = true ]; then
+        note "network: ethernet"
+        ethernet_up
+    elif grep -q 'network=' $wifi_dir/wpa_supplicant.conf 2>/dev/null; then
+        note "network: wifi (saved network, no mode set)"
+        wifi_up
+    else
+        note "network: none enabled"
+    fi
+
+    # GrumpyScreen's Network tab talks to wpa_supplicant, so run it in
+    # every mode except hotspot
+    if [ "$(netcfg wifiHotspotStatus)" = true ]; then
+        return
+    fi
+    if pidof wpa_supplicant >/dev/null 2>&1; then
+        return
+    fi
+    ifconfig wlan0 up
+    wpa_supplicant -Dnl80211 -iwlan0 -c$wifi_dir/wpa_supplicant.conf -B
+    # without a cable the saved Wi-Fi network needs an address
+    if [ "$(cable_state)" != 1 ]; then
+        udhcpc -b -i wlan0 -p /var/run/udhcpc-wlan0.pid
+    fi
+}
+
+note "FE: Starting AD5X network..."
+bring_up_network
+sleep 10
+
+note "FE: Launching Startup Scripts..."
+/usr/data/openad5x/startup/startup.sh
+
+# startup.sh puts every script in the background and returns straight
+# away. Keep this process alive: app_startup.sh puts the stock binary back
+# when no process called firmwareExe is running.
+while :; do
+    sleep 3600
+done
